@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+charts/
+.bot_state.json
+.env
+.git
+.gitignore
