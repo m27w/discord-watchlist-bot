@@ -15,17 +15,13 @@ Data sources
 - Stocks/indices/commodities/FX: Yahoo Finance via yfinance (free feeds can be delayed)
   For true second-level equities, plug in a paid feed (Polygon/Finnhub/Alpaca). Provider layer is modular.
 
-Environment (set in Render dashboard)
+Environment (Railway → Variables)
 - DISCORD_WEBHOOK_URL (secret) — REQUIRED
 - WATCHLIST_STOCKS — e.g. AAPL,MSFT,^NDX,^GSPC,GC=F,CL=F,JPY=X
 - WATCHLIST_CRYPTO — e.g. ETHUSDT,TRXUSDT,BTCUSDT,ADAUSDT
 - POLL_SECONDS (default 60), POST_MODE=changed|always, INTERVAL=1m
 - RSI_PERIOD, RSI_OVERBOUGHT, RSI_OVERSOLD, EMA_FAST, EMA_SLOW
 - ATR_PERIOD, ATR_MULTIPLIER, LEVEL_TOL_PCT, TIMEZONE
-
-Run
-- python discord_watchlist_bot.py
-- Or a single pass (useful for serverless/cron): python discord_watchlist_bot.py --once
 """
 import os
 import json
@@ -69,6 +65,14 @@ logging.basicConfig(
     format="[%(asctime)s] %(levelname)s: %(message)s",
 )
 
+# -------------------- Helpers --------------------
+def as_float(x):
+    """Return a plain Python float from a numpy/pandas scalar."""
+    try:
+        return float(x.item())  # numpy scalar path
+    except AttributeError:
+        return float(x)
+
 # -------------------- Providers --------------------
 class BaseProvider:
     name = "base"
@@ -87,7 +91,9 @@ class YahooProvider(BaseProvider):
         self.yf = yf
     def get_recent_candles(self, symbol: str, interval: str = "1m", limit: int = 300) -> pd.DataFrame:
         # Works for stocks, indices (^GSPC), futures (GC=F), FX (JPY=X), LSE tickers (RR.L/BP.L).
-        df = self.yf.download(symbol, period="1d", interval=interval, progress=False)
+        df = self.yf.download(
+            symbol, period="1d", interval=interval, progress=False, auto_adjust=False
+        )
         if df is None or df.empty:
             return pd.DataFrame(columns=["open","high","low","close","volume"])
         df = df.rename(columns=str.lower)
@@ -186,7 +192,7 @@ def find_sr_levels(df: pd.DataFrame, lookback: int = 200, window: int = 3, tol_p
             if not out or abs(v - out[-1]) > tol:
                 out.append(v)
         return out
-    px = float(df["close"].iloc[-1])
+    px = as_float(df["close"].iloc[-1])
     tol = max(px * tol_pct, 1e-9)
     return Levels(
         support=dedupe(lows, tol),
@@ -215,28 +221,32 @@ class Signals:
 
 def make_signals(df: pd.DataFrame) -> Signals:
     if df.empty or len(df) < max(EMA_SLOW + 2, RSI_PERIOD + 2, ATR_PERIOD + 2):
-        return Signals(short="NO DATA", long="NO DATA", optimal_buy=None, stop_suggestion=None, take_profit=None, rsi_value=None)
+        return Signals(short="NO DATA", long="NO DATA",
+                       optimal_buy=None, stop_suggestion=None,
+                       take_profit=None, rsi_value=None)
 
     close = df["close"]
-    ema_fast = ema(close, EMA_FAST)
-    ema_slow = ema(close, EMA_SLOW)
+    ema_fast_ser = ema(close, EMA_FAST)
+    ema_slow_ser = ema(close, EMA_SLOW)
     rsi_series = rsi(close, RSI_PERIOD)
     atr_series = atr(df, ATR_PERIOD)
     lvls = find_sr_levels(df, tol_pct=LEVEL_TOL_PCT)
 
-    last = float(close.iloc[-1])
-    last_rsi = float(rsi_series.iloc[-1])
-    last_atr = float(atr_series.iloc[-1])
-    uptrend = ema_fast.iloc[-1] > ema_slow.iloc[-1]
+    last = as_float(close.iloc[-1])
+    last_rsi = as_float(rsi_series.iloc[-1])
+    last_atr = as_float(atr_series.iloc[-1])
+
+    # ensure real boolean (not a pandas Series)
+    uptrend = bool(as_float(ema_fast_ser.iloc[-1]) > as_float(ema_slow_ser.iloc[-1]))
 
     # nearest support below, resistance above
     s = nearest_level(lvls.support, last, below=True)
     r = nearest_level(lvls.resistance, last, below=False)
 
-    # Optimal buy definition: nearest support; fallback EMA_slow
-    optimal_buy = s if s is not None else float(ema_slow.iloc[-1])
+    # Optimal buy = nearest support; fallback EMA slow
+    optimal_buy = s if s is not None else as_float(ema_slow_ser.iloc[-1])
 
-    # Short-term: RSI + proximity to S/R within 0.5*ATR
+    # Short-term signal using RSI + proximity to S/R within 0.5 * ATR
     short_sig = "HOLD"
     if s is not None and (last - s) <= 0.5 * last_atr and last_rsi <= RSI_OVERSOLD + 5:
         short_sig = "BUY"
@@ -249,7 +259,7 @@ def make_signals(df: pd.DataFrame) -> Signals:
     # ATR trailing stop
     stop = last - ATR_MULTIPLIER * last_atr if uptrend else last + ATR_MULTIPLIER * last_atr
 
-    # Take-profit suggestion: nearest resistance
+    # Take-profit = nearest resistance
     take_profit = r
 
     return Signals(
@@ -284,7 +294,7 @@ def make_chart(symbol: str, df: pd.DataFrame, path: str) -> None:
     ax.plot(ema_s.index, ema_s.values, label=f"EMA{ema_s_span}")
 
     lvls = find_sr_levels(df)
-    last = float(df["close"].iloc[-1])
+    last = as_float(df["close"].iloc[-1])
     s = nearest_level(lvls.support, last, below=True)
     r = nearest_level(lvls.resistance, last, below=False)
     if s is not None:
@@ -388,13 +398,14 @@ def process_symbol(market: str, symbol: str, state: Dict) -> None:
     last_px = provider.get_last_price(symbol)
     if last_px is None:
         if not candles.empty:
-            last_px = float(candles["close"].iloc[-1])
+            last_px = as_float(candles["close"].iloc[-1])
         else:
             logging.warning("No price for %s", symbol)
             return
 
     # Chart file
-    img_path = os.path.join(CHART_DIR, f"{market}_{symbol.replace('^','').replace('=','').replace('/','-')}.png")
+    safe_name = symbol.replace('^','').replace('=','').replace('/','-')
+    img_path = os.path.join(CHART_DIR, f"{market}_{safe_name}.png")
     try:
         make_chart(symbol, candles, img_path)
     except Exception:
@@ -429,7 +440,7 @@ def process_symbol(market: str, symbol: str, state: Dict) -> None:
         else:
             logging.warning("Post failed for %s", key)
     else:
-        logging.error("No DISCORD_WEBHOOK_URL set. Set it in Render → Environment as a Secret.")
+        logging.error("No DISCORD_WEBHOOK_URL set. Set it in Railway → Variables as a Secret.")
 
 # -------------------- Main loop --------------------
 def run_once(symbols_stocks: List[str], symbols_crypto: List[str]) -> None:
