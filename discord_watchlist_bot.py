@@ -13,7 +13,6 @@ What it does
 Data sources
 - Crypto: Binance public REST (near-real-time)
 - Stocks/indices/commodities/FX: Yahoo Finance via yfinance (free feeds can be delayed)
-  For true second-level equities, plug in a paid feed (Polygon/Finnhub/Alpaca). Provider layer is modular.
 
 Environment (Railway → Variables)
 - DISCORD_WEBHOOK_URL (secret) — REQUIRED
@@ -64,6 +63,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s: %(message)s",
 )
+logging.info("Bot version: 2025-08-29-fixB")  # << visible in logs
 
 # -------------------- Helpers --------------------
 def as_float(x):
@@ -74,7 +74,7 @@ def as_float(x):
         return float(x)
 
 def safe_tail(series: pd.Series, span: int) -> int:
-    """Pick a safe EMA span not exceeding length of the series (prevents degenerate EMAs)."""
+    """Pick a safe EMA span not exceeding length of the series."""
     n = len(series)
     if n <= 2:
         return max(2, n)
@@ -97,7 +97,7 @@ class YahooProvider(BaseProvider):
             raise SystemExit("Missing yfinance. Run: pip install yfinance")
         self.yf = yf
     def get_recent_candles(self, symbol: str, interval: str = "1m", limit: int = 300) -> pd.DataFrame:
-        # Works for stocks, indices (^GSPC), futures (GC=F), FX (JPY=X), LSE tickers (RR.L/BP.L).
+        # stocks, indices (^GSPC), futures (GC=F), FX (JPY=X), LSE tickers (RR.L/BP.L).
         df = self.yf.download(
             symbol, period="1d", interval=interval, progress=False, auto_adjust=False
         )
@@ -397,7 +397,6 @@ def process_symbol(market: str, symbol: str, state: Dict) -> None:
         if market == 'crypto':
             candles = provider.get_recent_candles(symbol, interval=INTERVAL if INTERVAL in {"1m","3m","5m","15m","30m"} else "1m")
         else:
-            # yfinance behaves best with 1m here
             candles = provider.get_recent_candles(symbol, interval="1m")
     except Exception:
         logging.exception("Failed to fetch candles for %s %s", market, symbol)
@@ -456,7 +455,7 @@ def run_once(symbols_stocks: List[str], symbols_crypto: List[str]) -> None:
     state = load_state()
     for sym in symbols_stocks:
         process_symbol("stock", sym, state)
-        time.sleep(1)  # gentle pacing
+        time.sleep(1)
     for sym in symbols_crypto:
         process_symbol("crypto", sym, state)
         time.sleep(1)
@@ -488,7 +487,6 @@ def main():
         logging.info("Sleeping %ss", sleep_for)
         time.sleep(sleep_for)
 
-# expose run_once for serverless reuse if needed
 __all__ = ["run_once"]
 
 if __name__ == "__main__":
