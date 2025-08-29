@@ -2,29 +2,37 @@
 """
 Discord Watchlist Webhook Bot — Stocks + Crypto
 
-- Polls your watchlist on a schedule (default per-minute)
-- Builds a chart and posts to a Discord channel via Webhook
-- Calculates RSI/EMA/ATR + support/resistance; suggests optimal buy (support), take-profit (resistance), and ATR stop
-- Posts text-only if a chart fails (won’t abort posting)
-- Yahoo (stocks) falls back to 5m data if 1m is sparse/closed
+Optimizations:
+- Headless matplotlib ("Agg") + smaller PNGs (dpi=110)
+- Build chart ONLY when a post will be sent
+- Mini "no data" chart for sparse markets
+- Randomized inter-symbol sleeps to reduce burstiness
+- Discord 429 handling (retry_after + exponential backoff)
+- Yahoo 1m→5m fallback; optional batch crypto prices per cycle
 
 ENV (Railway → Variables)
   DISCORD_WEBHOOK_URL  (required)
-  WATCHLIST_STOCKS     e.g. AMD,PLTR,BABA,GOOG,META,MSFT,AAPL,NVDA,TSLA,AMZN,RR.L,BP.L,^NDX,^GSPC,^DJI,GC=F,CL=F,JPY=X
-  WATCHLIST_CRYPTO     e.g. XLMUSDT,TRXUSDT,SHIBUSDT,DOGEUSDT,XRPUSDT,ETHUSDT,FLRUSDT,SOLUSDT,ADAUSDT,BTCUSDT
+  WATCHLIST_STOCKS
+  WATCHLIST_CRYPTO
   POLL_SECONDS=60  POST_MODE=changed|always  INTERVAL=1m
   RSI_PERIOD=14  RSI_OVERBOUGHT=70  RSI_OVERSOLD=30
   EMA_FAST=50  EMA_SLOW=200  ATR_PERIOD=14  ATR_MULTIPLIER=2.0
   LEVEL_TOL_PCT=0.004
 """
-import os, json, time, logging, argparse
+
+import os, json, time, logging, argparse, random, math
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import requests
 import numpy as np
 import pandas as pd
+
+# ---- matplotlib headless backend
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 from dotenv import load_dotenv
 
 # -------------------- Config --------------------
@@ -51,17 +59,15 @@ CHART_DIR = os.path.join(os.getcwd(), "charts")
 os.makedirs(CHART_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
-logging.info("Bot version: 2025-08-29-fixC")
+logging.info("Bot version: 2025-08-29-OPT1")
 
 # -------------------- Helpers --------------------
 def as_float(x):
     """Return a plain Python float from numpy/pandas scalars or arrays."""
     if x is None:
         return None
-    # If it's a numpy array with a single element, unwrap
     if isinstance(x, (np.ndarray, list, tuple)):
-        if len(x) == 0:
-            return None
+        if len(x) == 0: return None
         x = x[0]
     try:
         return float(getattr(x, "item", lambda: x)())
@@ -70,9 +76,11 @@ def as_float(x):
 
 def safe_span(series: pd.Series, span: int) -> int:
     n = len(series)
-    if n <= 2:
-        return max(2, n)
+    if n <= 2: return max(2, n)
     return min(max(2, span), n - 1)
+
+def rand_sleep(lo=0.3, hi=0.8):
+    time.sleep(random.uniform(lo, hi))
 
 # -------------------- Providers --------------------
 class BaseProvider:
@@ -99,7 +107,6 @@ class YahooProvider(BaseProvider):
         return df[["open","high","low","close","volume"]]
 
     def get_recent_candles(self, symbol: str, interval: str = "1m", limit: int = 300) -> pd.DataFrame:
-        # Try 1m for today; if empty/sparse (closed market / some indices), fall back to 5m (last 5 days)
         df = self._dl(symbol, "1d", "1m")
         if df.empty or len(df) < 30:
             df = self._dl(symbol, "5d", "5m")
@@ -138,7 +145,24 @@ class BinanceProvider(BaseProvider):
             df[c] = df[c].astype(float)
         return df[["open","high","low","close","volume"]]
 
+    # --- batch prices to reduce API calls per cycle
+    def get_all_prices(self, symbols: List[str]) -> Dict[str, float]:
+        url = f"{self.BASE}/api/v3/ticker/price"
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return {}
+        out = {}
+        try:
+            for row in r.json():
+                s = row.get("symbol")
+                if s in symbols:
+                    out[s] = float(row.get("price", "nan"))
+        except Exception:
+            pass
+        return out
+
     def get_last_price(self, symbol: str) -> Optional[float]:
+        # kept for compatibility; batch path will be used in run_once
         url = f"{self.BASE}/api/v3/ticker/price"
         r = requests.get(url, params={"symbol": symbol}, timeout=10)
         if r.status_code != 200:
@@ -266,11 +290,11 @@ def make_signals(df: pd.DataFrame) -> Signals:
 
 # -------------------- Charting --------------------
 def make_chart(symbol: str, df: pd.DataFrame, path: str) -> None:
-    # Always create *some* image so message can include an attachment.
-    if df.empty:
+    # Produce something even if data is sparse (mini chart)
+    if df.empty or len(df) < 20:
         fig = plt.figure(figsize=(8, 3))
         plt.title(f"{symbol} — no intraday data")
-        plt.savefig(path, bbox_inches='tight')
+        plt.savefig(path, bbox_inches='tight', dpi=110)
         plt.close(fig)
         return
 
@@ -301,52 +325,65 @@ def make_chart(symbol: str, df: pd.DataFrame, path: str) -> None:
     ax.legend(loc="best"); ax.grid(True, alpha=0.2)
 
     fig.tight_layout()
-    plt.savefig(path, bbox_inches='tight')
+    plt.savefig(path, bbox_inches='tight', dpi=110)
     plt.close(fig)
 
-# -------------------- Discord --------------------
+# -------------------- Discord (429-aware) --------------------
 def send_discord(webhook: str, content: str, embed: Dict, image_path: Optional[str]) -> bool:
-    """Send with optional image. If image_path is None/missing, post without file."""
-    try:
-        payload = {"content": content, "embeds": [dict(embed)], "username": "Watchlist Bot"}
-        files = None
-        if image_path and os.path.exists(image_path):
-            with open(image_path, "rb") as f:
-                files = {'file': (os.path.basename(image_path), f, 'image/png')}
-                payload["embeds"][0]["image"] = {"url": f"attachment://{os.path.basename(image_path)}"}
-                r = requests.post(webhook, data={"payload_json": json.dumps(payload)}, files=files, timeout=20)
-        else:
-            r = requests.post(webhook, json=payload, timeout=20)
+    """Send with optional image. Handles 429 with retry_after."""
+    payload = {"content": content, "embeds": [dict(embed)], "username": "Watchlist Bot"}
+    attempt, backoff = 0, 1.2
+    while attempt < 4:
+        attempt += 1
+        try:
+            if image_path and os.path.exists(image_path):
+                with open(image_path, "rb") as f:
+                    files = {'file': (os.path.basename(image_path), f, 'image/png')}
+                    payload["embeds"][0]["image"] = {"url": f"attachment://{os.path.basename(image_path)}"}
+                    r = requests.post(webhook, data={"payload_json": json.dumps(payload)}, files=files, timeout=20)
+            else:
+                r = requests.post(webhook, json=payload, timeout=20)
 
-        if 200 <= r.status_code < 300:
-            return True
-        logging.warning("Discord response %s: %s", r.status_code, r.text[:200])
-        return False
-    except Exception as e:
-        logging.exception("send_discord failed: %s", e)
-        return False
+            if 200 <= r.status_code < 300:
+                return True
+
+            if r.status_code == 429:
+                try:
+                    retry_after = r.json().get("retry_after", 1.0)
+                except Exception:
+                    retry_after = 1.0
+                sleep_s = min(10.0, float(retry_after) * backoff)
+                logging.warning("Discord 429; retrying in %.2fs", sleep_s)
+                time.sleep(sleep_s)
+                backoff *= 1.5
+                continue
+
+            logging.warning("Discord response %s: %s", r.status_code, r.text[:200])
+            return False
+
+        except Exception as e:
+            logging.warning("send_discord attempt %d failed: %s", attempt, e)
+            time.sleep(backoff)
+            backoff *= 1.5
+    return False
 
 # -------------------- State --------------------
 def load_state() -> Dict:
-    if not os.path.exists(STATE_FILE):
-        return {}
+    if not os.path.exists(STATE_FILE): return {}
     try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
+        with open(STATE_FILE, "r") as f: return json.load(f)
     except Exception:
         return {}
 
 def save_state(state: Dict) -> None:
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
+        with open(STATE_FILE, "w") as f: json.dump(state, f, indent=2)
     except Exception:
         logging.warning("Could not write state file.")
 
 # -------------------- Messaging --------------------
 def format_price(x: float) -> str:
-    if x is None:
-        return "—"
+    if x is None: return "—"
     if x >= 1000: return f"{x:,.2f}"
     if x >= 1:    return f"{x:.2f}"
     return f"{x:.6f}".rstrip('0').rstrip('.')
@@ -369,37 +406,31 @@ def build_embed(symbol: str, market: str, price: float, sig: Signals) -> Dict:
     }
 
 # -------------------- Orchestration --------------------
-def process_symbol(market: str, symbol: str, state: Dict) -> None:
+def process_symbol(market: str, symbol: str, state: Dict, price_cache: Optional[Dict[str, float]] = None) -> None:
     provider = PROVIDERS["crypto" if market == "crypto" else "stocks"]
 
-    # 1) Get candles
+    # 1) Fetch candles
     try:
         if market == "crypto":
             candles = provider.get_recent_candles(symbol, interval=INTERVAL if INTERVAL in {"1m","3m","5m","15m","30m"} else "1m")
         else:
-            candles = provider.get_recent_candles(symbol, interval="1m")  # Yahoo handles fallback internally
+            candles = provider.get_recent_candles(symbol, interval="1m")
     except Exception:
         logging.exception("Failed to fetch candles for %s %s", market, symbol)
         candles = pd.DataFrame(columns=["open","high","low","close","volume"])
 
-    # 2) Signals & price
+    # 2) Signals & price (last_px can be taken from cache for crypto)
     sig = make_signals(candles) if not candles.empty else Signals("NO DATA","NO DATA",None,None,None,None)
-    last_px = provider.get_last_price(symbol)
+
+    last_px = None
+    if market == "crypto" and price_cache is not None:
+        last_px = price_cache.get(symbol)
     if last_px is None:
-        last_px = as_float(candles["close"].iloc[-1]) if not candles.empty else None
+        last_px = provider.get_last_price(symbol)
+    if last_px is None and not candles.empty:
+        last_px = as_float(candles["close"].iloc[-1])
 
-    # 3) Chart (do NOT abort posting if chart fails)
-    safe_name = symbol.replace("^","").replace("=","").replace("/","-")
-    img_path = os.path.join(CHART_DIR, f"{market}_{safe_name}.png")
-    try:
-        make_chart(symbol, candles, img_path)
-        have_img = True
-    except Exception:
-        logging.exception("Chart failed for %s", symbol)
-        have_img = False
-        img_path = None
-
-    # 4) Anti-spam signature
+    # 3) Anti-spam signature BEFORE chart work
     new_signature = {
         "short": sig.short, "long": sig.long,
         "optimal": round(sig.optimal_buy or 0, 8),
@@ -414,9 +445,20 @@ def process_symbol(market: str, symbol: str, state: Dict) -> None:
         logging.info("No change for %s — skipping post.", key)
         return
 
+    # 4) Build chart ONLY if we're posting
+    safe_name = symbol.replace("^","").replace("=","").replace("/","-")
+    img_path = os.path.join(CHART_DIR, f"{market}_{safe_name}.png")
+    have_img = False
+    try:
+        make_chart(symbol, candles, img_path)
+        have_img = True
+    except Exception:
+        logging.exception("Chart failed for %s (posting text-only)", symbol)
+        img_path = None
+
+    # 5) Send
     embed = build_embed(symbol, market, float(last_px) if last_px is not None else None, sig)
     content = f"**{symbol}** update — {time.strftime('%Y-%m-%d %H:%M:%S')}"
-
     if DISCORD_WEBHOOK_URL:
         ok = send_discord(DISCORD_WEBHOOK_URL, content, embed, img_path if have_img else None)
         if ok:
@@ -430,12 +472,25 @@ def process_symbol(market: str, symbol: str, state: Dict) -> None:
 
 def run_once(symbols_stocks: List[str], symbols_crypto: List[str]) -> None:
     state = load_state()
+
+    # Batch crypto prices (single request)
+    crypto_price_cache = {}
+    try:
+        if symbols_crypto:
+            crypto_price_cache = PROVIDERS["crypto"].get_all_prices(symbols_crypto)
+    except Exception:
+        logging.exception("Fetching batch crypto prices failed")
+
+    posted = 0
     for sym in symbols_stocks:
-        process_symbol("stock", sym, state)
-        time.sleep(1)
+        process_symbol("stock", sym, state, None)
+        posted += 1
+        rand_sleep()
     for sym in symbols_crypto:
-        process_symbol("crypto", sym, state)
-        time.sleep(1)
+        process_symbol("crypto", sym, state, crypto_price_cache)
+        posted += 1
+        rand_sleep()
+    logging.info("Cycle complete: processed=%d", posted)
 
 def main():
     p = argparse.ArgumentParser()
