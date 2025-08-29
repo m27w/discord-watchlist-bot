@@ -67,11 +67,18 @@ logging.basicConfig(
 
 # -------------------- Helpers --------------------
 def as_float(x):
-    """Return a plain Python float from a numpy/pandas scalar."""
+    """Return a plain Python float from a numpy/pandas scalar or python number."""
     try:
         return float(x.item())  # numpy scalar path
     except AttributeError:
         return float(x)
+
+def safe_tail(series: pd.Series, span: int) -> int:
+    """Pick a safe EMA span not exceeding length of the series (prevents degenerate EMAs)."""
+    n = len(series)
+    if n <= 2:
+        return max(2, n)
+    return min(span, max(2, n - 1))
 
 # -------------------- Providers --------------------
 class BaseProvider:
@@ -153,9 +160,11 @@ class Levels:
     resistance: List[float]
 
 def ema(series: pd.Series, span: int) -> pd.Series:
+    span = safe_tail(series, span)
     return series.ewm(span=span, adjust=False).mean()
 
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    period = max(2, period)
     delta = close.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
@@ -165,6 +174,7 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    period = max(2, period)
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
@@ -237,7 +247,8 @@ def make_signals(df: pd.DataFrame) -> Signals:
     last_atr = as_float(atr_series.iloc[-1])
 
     # ensure real boolean (not a pandas Series)
-    uptrend = bool(as_float(ema_fast_ser.iloc[-1]) > as_float(ema_slow_ser.iloc[-1]))
+    uptrend = as_float(ema_fast_ser.iloc[-1]) > as_float(ema_slow_ser.iloc[-1])
+    uptrend = bool(uptrend)
 
     # nearest support below, resistance above
     s = nearest_level(lvls.support, last, below=True)
@@ -282,16 +293,14 @@ def make_chart(symbol: str, df: pd.DataFrame, path: str) -> None:
 
     plot_df = df.iloc[-150:] if len(df) > 150 else df
     clos = plot_df["close"]
-    ema_f_span = EMA_FAST if EMA_FAST < len(clos) else max(2, len(clos)//3)
-    ema_s_span = EMA_SLOW if EMA_SLOW < len(clos) else max(4, len(clos)//2)
-    ema_f = ema(clos, ema_f_span)
-    ema_s = ema(clos, ema_s_span)
+    ema_f = ema(clos, EMA_FAST)
+    ema_s = ema(clos, EMA_SLOW)
 
     fig = plt.figure(figsize=(9, 4))
     ax = plt.gca()
     ax.plot(clos.index, clos.values, label="Close")
-    ax.plot(ema_f.index, ema_f.values, label=f"EMA{ema_f_span}")
-    ax.plot(ema_s.index, ema_s.values, label=f"EMA{ema_s_span}")
+    ax.plot(ema_f.index, ema_f.values, label=f"EMA{safe_tail(clos, EMA_FAST)}")
+    ax.plot(ema_s.index, ema_s.values, label=f"EMA{safe_tail(clos, EMA_SLOW)}")
 
     lvls = find_sr_levels(df)
     last = as_float(df["close"].iloc[-1])
