@@ -1,6 +1,7 @@
-requests
-pandas
-numpy
-yfinance
-matplotlib
-python-dotenv
+yfinance>=0.2.40
+pandas>=2.2
+numpy>=1.26
+matplotlib>=3.8
+python-dotenv>=1.0
+holidays>=0.50
+requests>=2.31
