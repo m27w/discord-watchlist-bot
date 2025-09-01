@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Discord Watchlist Webhook Bot — Stocks + Crypto
-Build: 2025-09-01-ALERTS-FULL
+Build: 2025-09-01-ALERTS-STYLED
 
 Adds in this build:
 - Holiday closure notices (US/GB by default; overridable per symbol)
 - Weekend closure (configurable for indices/futures/FX)
-- Primary & Secondary support ("best buy-in" levels) on embeds
+- Primary & Secondary support ("best buy-in" levels) on embeds + charts
 - Global alert channel that pings @everyone when price taps best buy-ins
+- 🚨 Styled alert embed (emoji title, red color, concise fields, NFA footer)
 - Alert cooldowns/anti-spam
 - Keeps strict routing, per-symbol posting, charts, RSI/EMA/ATR, batching, Discord 429 handling
 
@@ -77,7 +78,7 @@ CHART_DIR = os.path.join(os.getcwd(), "charts")
 os.makedirs(CHART_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
-logging.info("Bot version: 2025-09-01-ALERTS-FULL")
+logging.info("Bot version: 2025-09-01-ALERTS-STYLED")
 
 # -------------------- Helpers --------------------
 def as_float(x):
@@ -385,7 +386,6 @@ def format_price(x:float)->str:
     if x>=1: return f"{x:.2f}"
     return f"{x:.6f}".rstrip('0').rstrip('.')
 
-# redefine build_embed to include primary/secondary support
 def build_embed(symbol:str,market:str,price:float,sig:Signals,
                 primary:Optional[float]=None,secondary:Optional[float]=None)->Dict:
     fields=[
@@ -409,7 +409,7 @@ def build_embed(symbol:str,market:str,price:float,sig:Signals,
         "footer": {"text": f"Interval {INTERVAL} | Provider: {provider}"},
     }
 
-# -------------------- Alerts --------------------
+# -------------------- Alerts (styled) --------------------
 def within_buy_zone(price: float, level: float, last_atr: Optional[float]) -> bool:
     """
     Consider it a 'tap' if:
@@ -439,22 +439,39 @@ def mark_cooldown(state: Dict, symbol: str, tag: str) -> None:
     key = f"alert:{symbol}:{tag}"
     state[key] = datetime.utcnow().isoformat()
 
-def send_buy_alert(symbol: str, market: str, price: float, level: float, level_tag: str) -> bool:
+def send_buy_alert(symbol: str, market: str, price: float, level: float, level_tag: str,
+                   primary: Optional[float], secondary: Optional[float],
+                   atr_stop: Optional[float]) -> bool:
+    """Styled alert embed for the #alerts channel."""
     if not ALERT_ENABLED or not ALERT_WEBHOOK_URL:
         return False
     if ALERT_MARKETS != "both" and ALERT_MARKETS != market:
         return False
+
     mention = "@everyone " if ALERT_EVERYONE else ""
-    content = f"{mention}**{symbol}** tapped **{level_tag} support** at `{format_price(price)}` (level `{format_price(level)}`)."
+    title = f"🚨 ALERT – {symbol} at Support!"
+    desc = f"Price has tapped **{level_tag} support**."
+
+    fields = [
+        {"name": "Price", "value": f"`{format_price(price)}`", "inline": True},
+        {"name": f"{level_tag} Support", "value": f"`{format_price(level)}`", "inline": True},
+    ]
+    if primary is not None and (level_tag != "Primary"):
+        fields.append({"name":"Primary Support","value":f"`{format_price(primary)}`","inline":True})
+    if secondary is not None and (level_tag != "Secondary"):
+        fields.append({"name":"Secondary Support","value":f"`{format_price(secondary)}`","inline":True})
+    if atr_stop is not None:
+        fields.append({"name":"ATR Stop (suggestion)","value":f"`{format_price(atr_stop)}`","inline":True})
+
     embed = {
-        "title": f"{symbol} — Best Buy-in Alert",
-        "description": "Price has reached a key support level.",
-        "fields": [
-            {"name": "Level", "value": f"`{format_price(level)}`", "inline": True},
-            {"name": "Last Price", "value": f"`{format_price(price)}`", "inline": True},
-        ],
-        "footer": {"text": f"Market: {market} | Interval {INTERVAL}"}
+        "title": title,
+        "description": desc,
+        "color": 15158332,  # red accent
+        "fields": fields,
+        "footer": {"text": f"Market: {market} | Interval {INTERVAL} | ⚠️ Not financial advice"}
     }
+    content = f"{mention}**{symbol}** best buy-in opportunity detected."
+
     return send_discord(ALERT_WEBHOOK_URL, content, embed, None)
 
 # -------------------- Orchestration --------------------
@@ -535,10 +552,12 @@ def process_symbol(market:str,symbol:str,state:Dict,price_cache:Optional[Dict[st
 
     if ALERT_ENABLED and last_px is not None:
         if primary is not None and within_buy_zone(last_px, primary, last_atr) and cooldown_ok(state, symbol, "primary"):
-            if send_buy_alert(symbol, "crypto" if market=="crypto" else "stock", last_px, primary, "Primary"):
+            if send_buy_alert(symbol, "crypto" if market=="crypto" else "stock",
+                              last_px, primary, "Primary", primary, secondary, sig.stop_suggestion):
                 mark_cooldown(state, symbol, "primary"); save_state(state)
         if secondary is not None and within_buy_zone(last_px, secondary, last_atr) and cooldown_ok(state, symbol, "secondary"):
-            if send_buy_alert(symbol, "crypto" if market=="crypto" else "stock", last_px, secondary, "Secondary"):
+            if send_buy_alert(symbol, "crypto" if market=="crypto" else "stock",
+                              last_px, secondary, "Secondary", primary, secondary, sig.stop_suggestion):
                 mark_cooldown(state, symbol, "secondary"); save_state(state)
 
     # Anti-spam signature BEFORE chart work (for per-symbol channel)
@@ -602,8 +621,9 @@ def main():
     if not WATCHLIST_STOCKS and not WATCHLIST_CRYPTO:
         logging.error("Watchlists empty. Set WATCHLIST_STOCKS / WATCHLIST_CRYPTO."); return
 
-    logging.info("Starting — stocks=%s | crypto=%s | interval=%s | mode=%s | strict_routing=%s | holidays=%s",
-                 WATCHLIST_STOCKS, WATCHLIST_CRYPTO, INTERVAL, POST_MODE, STRICT_ROUTING, HOLIDAY_CLOSED)
+    logging.info("Starting — stocks=%s | crypto=%s | interval=%s | mode=%s | strict_routing=%s | holidays=%s | alerts=%s (%s)",
+                 WATCHLIST_STOCKS, WATCHLIST_CRYPTO, INTERVAL, POST_MODE, STRICT_ROUTING, HOLIDAY_CLOSED,
+                 ALERT_ENABLED, ALERT_MARKETS)
 
     if args.once:
         run_once(WATCHLIST_STOCKS, WATCHLIST_CRYPTO); return
